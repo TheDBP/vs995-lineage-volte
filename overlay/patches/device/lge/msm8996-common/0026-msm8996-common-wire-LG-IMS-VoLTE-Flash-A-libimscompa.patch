@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TheDBP <TheDBP@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 13:10:07 -0400
+Subject: [PATCH] msm8996-common: wire LG IMS (VoLTE) Flash A -- libimscompat,
+ Ims4 (apk-bundled 32-bit libs), namespace
+
+---
+ ims/Android.bp                 | 17 +++++++++
+ ims/ims.mk                     | 10 +++++
+ ims/libimscompat/Android.bp    | 11 ++++++
+ ims/libimscompat/imscompat.cpp | 68 ++++++++++++++++++++++++++++++++++
+ msm8996.mk                     | 12 ++++++
+ 5 files changed, 118 insertions(+)
+ create mode 100644 ims/Android.bp
+ create mode 100644 ims/ims.mk
+ create mode 100644 ims/libimscompat/Android.bp
+ create mode 100644 ims/libimscompat/imscompat.cpp
+
+diff --git a/ims/Android.bp b/ims/Android.bp
+new file mode 100644
+index 00000000..b5fbbfb0
+--- /dev/null
++++ b/ims/Android.bp
+@@ -0,0 +1,17 @@
++// Copyright (C) 2026 The LineageOS Project
++// SPDX-License-Identifier: Apache-2.0
++//
++// Ims4 is LG's stock IMS app, reworked for Android 17 by ims/build-ims4.sh (com.android.ims ->
++// com.lge.imslegacy, legacy framework merged in, re-signed with the platform key because it shares
++// android.uid.phone). The reworked apk is a build artifact staged under this dir as Ims4-reworked.apk;
++// it is NOT committed (derived from a proprietary app). See IMS.md "Build plan".
++
++android_app_import {
++    name: "Ims4",
++    apk: "Ims4-reworked.apk",
++    certificate: "platform",
++    privileged: true,
++    dex_preopt: {
++        enabled: false,
++    },
++}
+diff --git a/ims/ims.mk b/ims/ims.mk
+new file mode 100644
+index 00000000..816b23b2
+--- /dev/null
++++ b/ims/ims.mk
+@@ -0,0 +1,10 @@
++# LG IMS (voice VoLTE) -- Flash A. See IMS.md "Build plan".
++# libimscompat: the compat shim (dropped libutils symbols + load-only video/OMX stubs), /system/lib,
++# exposed in public.libraries so the apk-bundled libims resolves it from the shared system namespace.
++# Ims4: the reworked app (ims/build-ims4.sh), which BUNDLES the 32-bit LG SIP + QMI libs under
++# lib/armeabi-v7a/ -- that forces the com.lge.ims process 32-bit on zygote64_32 and loads the libs from
++# the app namespace's own path. No LG libs in /system/lib; only the framework libs they pull (and
++# libimscompat) are public (system/core patch to public.libraries.android.txt).
++PRODUCT_PACKAGES += \
++    libimscompat \
++    Ims4
+diff --git a/ims/libimscompat/Android.bp b/ims/libimscompat/Android.bp
+new file mode 100644
+index 00000000..bb69c48e
+--- /dev/null
++++ b/ims/libimscompat/Android.bp
+@@ -0,0 +1,11 @@
++// Copyright (C) 2026 The LineageOS Project
++// SPDX-License-Identifier: Apache-2.0
++
++cc_library_shared {
++    name: "libimscompat",
++    srcs: ["imscompat.cpp"],
++    shared_libs: ["libutils"],
++    // The asm-named load-only stubs deliberately redefine platform symbols; allow it.
++    cflags: ["-Wno-error"],
++    compile_multilib: "32",
++}
+diff --git a/ims/libimscompat/imscompat.cpp b/ims/libimscompat/imscompat.cpp
+new file mode 100644
+index 00000000..4ab71ad4
+--- /dev/null
++++ b/ims/libimscompat/imscompat.cpp
+@@ -0,0 +1,68 @@
++// libimscompat.so -- compatibility shim so LG's 2016 32-bit IMS stack (libims/libimsmmpf) loads on
++// Android 17. Wired in via device blob-fixups: libims/libimsmmpf get `add-needed libimscompat.so`
++// and the dead video DT_NEEDED removed.
++//
++//   * REAL reimplementations of two libutils symbols dropped since Android 7.
++//   * LOAD-ONLY stubs for libimsmmpf's video/OMX symbols -- voice never calls them. The Surface
++//     constructor and AudioSystem::setParameters are stubs; setParameters must be made real before
++//     the voice audio path works (see IMS.md). Never let the video path call these.
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++namespace android {
++// String8 is a single pointer to its SharedBuffer data; the ctor/dtor come from the live libutils.
++class String8 {
++public:
++    String8(const char* o);
++    String8(const String8& o);
++    ~String8();
++    String8 getPathLeaf() const;
++private:
++    const char* mString;
++};
++// com.android...String8::getPathLeaf() const  (mangled _ZNK7android7String811getPathLeafEv)
++String8 String8::getPathLeaf() const {
++    const char* cp = strrchr(mString, '/');
++    return cp ? String8(cp + 1) : String8(*this);
++}
++}  // namespace android
++
++// char* strndup16to8(const char16_t*, size_t): UTF-16 -> malloc'd UTF-8.
++extern "C" char* strndup16to8(const char16_t* s, size_t n) {
++    if (!s) return nullptr;
++    size_t len = 0;
++    for (size_t i = 0; i < n; i++) {
++        uint32_t c = s[i];
++        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && s[i+1] >= 0xDC00 && s[i+1] <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (s[i+1] - 0xDC00); i++; }
++        len += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
++    }
++    char* out = static_cast<char*>(malloc(len + 1));
++    if (!out) return nullptr;
++    char* p = out;
++    for (size_t i = 0; i < n; i++) {
++        uint32_t c = s[i];
++        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n && s[i+1] >= 0xDC00 && s[i+1] <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + (s[i+1] - 0xDC00); i++; }
++        if (c < 0x80) { *p++ = c; }
++        else if (c < 0x800) { *p++ = 0xC0 | (c >> 6); *p++ = 0x80 | (c & 0x3F); }
++        else if (c < 0x10000) { *p++ = 0xE0 | (c >> 12); *p++ = 0x80 | ((c >> 6) & 0x3F); *p++ = 0x80 | (c & 0x3F); }
++        else { *p++ = 0xF0 | (c >> 18); *p++ = 0x80 | ((c >> 12) & 0x3F); *p++ = 0x80 | ((c >> 6) & 0x3F); *p++ = 0x80 | (c & 0x3F); }
++    }
++    *p = 0;
++    return out;
++}
++
++// Load-only stubs: exact mangled names via asm labels, bodies return 0. NOT functional.
++extern "C" {
++long _imsc_cl(void)  __asm__("_ZN7android6Camera13connectLegacyEiiRKNS_8String16EiRNS_2spIS0_EE");
++long _imsc_pt(void)  __asm__("_ZN7android6Camera16setPreviewTargetERKNS_2spINS_22IGraphicBufferProducerEEE");
++long _imsc_ci(void)  __asm__("_ZN7android10CameraBaseINS_6CameraENS_12CameraTraitsIS1_EEE13getCameraInfoEiPNS_8hardware10CameraInfoE");
++long _imsc_un(void)  __asm__("_ZN7android19GraphicBufferMapper6unlockEPK13native_handle");
++long _imsc_su(void)  __asm__("_ZN7android7SurfaceC1ERKNS_2spINS_22IGraphicBufferProducerEEEb");
++long _imsc_ap(void)  __asm__("_ZN7android11AudioSystem13setParametersEiRKNS_7String8E");
++int OMX_Init(void); int OMX_Deinit(void); int OMX_GetHandle(void); int OMX_FreeHandle(void);
++long _imsc_cl(void) { return 0; } long _imsc_pt(void) { return 0; } long _imsc_ci(void) { return 0; }
++long _imsc_un(void) { return 0; } long _imsc_su(void) { return 0; } long _imsc_ap(void) { return 0; }
++int OMX_Init(void) { return 0; } int OMX_Deinit(void) { return 0; } int OMX_GetHandle(void) { return 0; } int OMX_FreeHandle(void) { return 0; }
++}
+diff --git a/msm8996.mk b/msm8996.mk
+index bed6f3a1..2cb376a8 100644
+--- a/msm8996.mk
++++ b/msm8996.mk
+@@ -466,3 +466,15 @@ PRODUCT_COPY_FILES += \
+ PRODUCT_COPY_FILES += \
+     frameworks/native/data/etc/android.hardware.wifi.direct.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.wifi.direct.xml \
+     frameworks/native/data/etc/android.hardware.wifi.xml:$(TARGET_COPY_OUT_VENDOR)/etc/permissions/android.hardware.wifi.xml
++
++# LG IMS (VoLTE). Gated on the forge's `volte` option, which turns itself on whenever a stock LG
++# system image is present and off when it is not -- see VOLTE_STOCK_GLOB in device.conf and
++# IMS.md. Everything ims.mk installs is rebuilt from that firmware and none of it can be committed,
++# so without it this include would make the tree unbuildable rather than merely VoLTE-less.
++#
++# A soft include would be the wrong tool: the artifacts are produced by the option's staging step,
++# so "missing" means the staging did not run, and the option's require.sh has already stopped the
++# build by then. This switch is about whether IMS was asked for at all.
++ifeq ($(WITH_VOLTE),true)
++include $(LOCAL_PATH)/ims/ims.mk
++endif

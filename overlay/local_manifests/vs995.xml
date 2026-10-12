@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- LG V20 Verizon (vs995) full dep chain: vs995 -> v20-common -> msm8996-common
+     -> {hardware_lge, kernel_lge_msm8996, hardware_sony_timekeep}. Source kernel: msm8996 4.4. -->
+<manifest>
+  <project name="LineageOS/android_device_lge_vs995"          path="device/lge/vs995"          remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_device_lge_v20-common"     path="device/lge/v20-common"     remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_device_lge_msm8996-common" path="device/lge/msm8996-common" remote="github" revision="lineage-22.2" />
+  <project name="LineageOS/android_hardware_lge"              path="hardware/lge"              remote="github" revision="lineage-22.2" />
+  <!-- lineage-24.0 dropped msm8996 from hardware/qcom-caf (it carries msm8953, sdm660 and
+       sm8150+ only). These three are the per-component CAF branches 22.2 used; the os_pickup
+       linkfiles in qcom-caf/common expect exactly these paths. -->
+  <!-- The namespace itself. vendor/lge/*/Android.bp declares soong_namespace
+       "hardware/qcom-caf/msm8996", which needs an Android.bp AT that path — created upstream by
+       linkfiles on hardware/qcom-caf/common. 24.0 kept the project and the os_pickup.bp/.mk files but
+       dropped the msm8996 entries with the platform, so they are re-declared here. msm8996 is a legacy
+       UM platform: os_pickup.bp, not the os_pickup_qssi.bp the sm8xxx targets use.
+       repo cannot add linkfiles to an existing project, hence remove-project then re-declare, keeping
+       every linkfile 24.0 already had. -->
+  <remove-project name="LineageOS/android_hardware_qcom-caf_common" />
+  <project path="hardware/qcom-caf/common" name="LineageOS/android_hardware_qcom-caf_common" groups="qcom">
+    <linkfile src="os_pickup_aosp.mk" dest="hardware/qcom/Android.mk" />
+    <linkfile src="os_pickup_sepolicy_vndr.mk" dest="device/qcom/sepolicy_vndr/SEPolicy.mk" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/msm8953/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sdm660/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8150/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8250/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8350/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8450/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8450-6.6/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8550/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8650/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8750/Android.bp" />
+    <linkfile src="os_pickup_qssi.bp" dest="hardware/qcom-caf/sm8850/Android.bp" />
+    <linkfile src="os_pickup.bp" dest="hardware/qcom-caf/msm8996/Android.bp" />
+    <linkfile src="os_pickup.mk" dest="hardware/qcom-caf/msm8996/Android.mk" />
+  </project>
+  <project path="hardware/qcom-caf/msm8996/audio"   name="LineageOS/android_hardware_qcom_audio"   remote="github" revision="lineage-22.2-caf-msm8996" groups="qcom,legacy-qcom" />
+  <project path="hardware/qcom-caf/msm8996/display" name="LineageOS/android_hardware_qcom_display" remote="github" revision="lineage-22.2-caf-msm8996" groups="qcom,legacy-qcom" />
+  <project path="hardware/qcom-caf/msm8996/media"   name="LineageOS/android_hardware_qcom_media"   remote="github" revision="lineage-22.2-caf-msm8996" groups="qcom,legacy-qcom" />
+  <!-- lineage-24.0's QTI power HAL added a dependency on
+       vendor.qti.hardware.display.config-V12-ndk, which comes from the SoC's display tree. The
+       msm8996 display tree defines no display.config at all, so the module cannot resolve. 23.2 is the
+       newest branch of this repo without that dependency; 22.2 also works but gives up two releases of
+       fixes for nothing. -->
+  <remove-project name="LineageOS/android_vendor_qcom_opensource_power" />
+  <project path="vendor/qcom/opensource/power" name="LineageOS/android_vendor_qcom_opensource_power" remote="github" revision="lineage-23.2" groups="qcom" />
+  <project name="LineageOS/android_hardware_sony_timekeep"    path="hardware/sony/timekeep"    remote="github" revision="lineage-24.0" />
+  <project name="LineageOS/android_kernel_lge_msm8996"        path="kernel/lge/msm8996"        remote="github" revision="lineage-22.2" />
+  <project name="TheMuppets/proprietary_vendor_lge_vs995"     path="vendor/lge/vs995"          remote="github" revision="lineage-22.2" />
+  <!-- The two common vendor trees are REQUIRED, not optional. The device trees pull them in with
+       the HARD forms (`include` / `inherit-product`, not -include / inherit-product-if-exists), so
+       a missing one is a make error at board-config parse, not a soft skip:
+         v20-common/BoardConfigCommon.mk:53  include vendor/lge/v20-common/BoardConfigVendor.mk
+         v20-common/v20.mk:21                inherit-product vendor/lge/v20-common/v20-common-vendor.mk
+         msm8996-common/BoardConfigCommon.mk:21  include vendor/lge/msm8996-common/BoardConfigVendor.mk
+         msm8996-common/msm8996.mk:19            inherit-product vendor/lge/msm8996-common/msm8996-common-vendor.mk
+       (vs995-vendor.mk itself is self-contained; it does not inherit these.) -->
+  <project name="TheMuppets/proprietary_vendor_lge_v20-common"     path="vendor/lge/v20-common"     remote="github" revision="lineage-22.2" />
+  <project name="TheMuppets/proprietary_vendor_lge_msm8996-common" path="vendor/lge/msm8996-common" remote="github" revision="lineage-22.2" />
+  <!-- GCC 4.9 prebuilts for the kernel. 24.0 deleted them, and this kernel is 4.4, so
+       KERNEL_NO_GCC is false and forge's lineage-24.0 vendor/lineage patch takes the GCC path:
+       clang as CC with the GCC prebuilts supplying binutils. Same pins as lineage-22.2. -->
+  <project name="LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9" path="prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9" remote="github" revision="lineage-19.1" clone-depth="1" />
+  <project name="LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9" path="prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9" remote="github" revision="lineage-19.1" clone-depth="1" />
+
+</manifest>

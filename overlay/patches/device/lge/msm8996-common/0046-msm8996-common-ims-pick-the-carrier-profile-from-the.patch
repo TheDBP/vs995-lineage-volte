@@ -1,0 +1,422 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TheDBP <TheDBP@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 19:56:09 -0400
+Subject: [PATCH] msm8996-common: ims: pick the carrier profile from the SIM so
+ REGISTER can do sec-agree
+
+The IMS profile provisioned into lgims.db decides whether the SIP REGISTER performs the RFC 3329
+security agreement, and stock picks that profile from the handset model: com.lge.os.Build.CA_TARGET
+is VZW/US on a vs995, so a Verizon profile is provisioned whatever SIM is present. That profile
+sets aos_reg_0_ipsec=false, the REGISTER carries no Security-Client, and any P-CSCF requiring
+sec-agree answers 421 Extension Required. Registration then blocks, because
+VZWAoSRegistration::ProcessStartFailed_StatusCode classifies 421 as non-retryable in a hardcoded
+bitmask that no provisioned retry policy can reach.
+
+The profile matching the SIM's own network sets aos_reg_0_ipsec=true. Verified on hardware with a
+T-Mobile SIM: Security-Client offered, 401 with Security-Server instead of 421, AKA answered by the
+ISIM, four SAs and six SPs installed through ipsecstarter and ipsecclient, protected re-REGISTER
+answered 200 OK, STATE_REGISTERED and IMS_VOLTE_INDICATOR_ON.
+
+Selection uses the stock override rather than new app code: OperatorInfo reads
+persist.lg.ims.pref_operator and persist.lg.ims.pref_country in its static initialiser and prefers
+them over the model target. A oneshot started from gsm.sim.operator.numeric maps the MCCMNC through
+ims-operator-map.txt and sets them. The non-US entries come from the stock app's own mccmnc_list,
+filtered to operators that ship a profile; that table has no US coverage because LG pins US carriers
+to the model, so US entries are added. An unmapped SIM leaves both properties unset and the stock
+target profile applies, so only mapped codes change behaviour.
+
+The properties persist, so a boot that reads the SIM after the app has initialised still leaves the
+correct value for the next one. Verified on device that the mapping resolves, that a second run is a
+no-op rather than forcing a needless re-provision, and that an unmapped code leaves the properties
+untouched.
+
+---
+ ims/Android.bp                       |  17 +++
+ ims/ims-operator-map.txt             | 209 +++++++++++++++++++++++++++
+ ims/ims.mk                           |   8 +
+ ims/lge-ims-operator.rc              |  12 ++
+ ims/lge-ims-operator.sh              |  52 +++++++
+ sepolicy/private/file_contexts       |   3 +
+ sepolicy/private/lge_ims_operator.te |  24 +++
+ 7 files changed, 325 insertions(+)
+ create mode 100644 ims/ims-operator-map.txt
+ create mode 100644 ims/lge-ims-operator.rc
+ create mode 100755 ims/lge-ims-operator.sh
+ create mode 100644 sepolicy/private/lge_ims_operator.te
+
+diff --git a/ims/Android.bp b/ims/Android.bp
+index e65d58f2..874c1c4c 100644
+--- a/ims/Android.bp
++++ b/ims/Android.bp
+@@ -46,3 +46,20 @@ cc_prebuilt_binary {
+         none: true,
+     },
+ }
++
++// Carrier profile selection. The profile provisioned into lgims.db is what decides whether the SIP
++// REGISTER performs the RFC 3329 security agreement, and stock picks it from the handset model
++// rather than the SIM. lge-ims-operator.sh maps the SIM's MCCMNC onto a profile that the app
++// actually ships and sets the stock preference properties OperatorInfo reads. See the script.
++sh_binary {
++    name: "lge-ims-operator.sh",
++    src: "lge-ims-operator.sh",
++    init_rc: ["lge-ims-operator.rc"],
++    required: ["ims-operator-map.txt"],
++}
++
++prebuilt_etc {
++    name: "ims-operator-map.txt",
++    src: "ims-operator-map.txt",
++    sub_dir: "ims",
++}
+diff --git a/ims/ims-operator-map.txt b/ims/ims-operator-map.txt
+new file mode 100644
+index 00000000..97d3d4b5
+--- /dev/null
++++ b/ims/ims-operator-map.txt
+@@ -0,0 +1,209 @@
++# MCCMNC to LG IMS carrier profile. One entry per line: <mccmnc> <operator> <country>.
++# <operator>/<country> names a profile that exists in the stock app's
++# assets/Configuration/<operator>/<country>/configuration.<operator>.<country>.xml, which is what
++# provisions lgims.db and therefore decides whether the profile performs the RFC 3329 security
++# agreement (aos_reg_0_ipsec).
++#
++# Non-US entries come from the stock app's own assets/SmartConfiguration/SmartConfiguration.xml
++# mccmnc_list, filtered to the operators that actually ship a profile. That table has no US
++# coverage, because LG pins US carriers to the device model (operator_based_on="target"), so the
++# US entries below are added. Only mapped codes change behaviour: an unmapped SIM leaves the
++# preference properties unset and the stock target profile applies.
++#
++# Regenerate the non-US block from a stock apk with the mccmnc_list reader in IMS.md.
++#
++# Sprint codes map to TMO: that network was decommissioned and those SIMs run on T-Mobile, whose
++# P-CSCFs require the security agreement, while the SPR profile sets aos_reg_0_ipsec=false.
++20201 DTAG GR
++20205 VDF GR
++20402 TELE2 NL
++20404 VDF NL
++20408 KPN NL
++20416 DTAG NL
++20420 DTAG NL
++20801 ORG FR
++20809 SFR FR
++20810 SFR FR
++20820 BYT FR
++21401 VDF ES
++21403 ORG ES
++21630 DTAG HU
++21670 VDF HU
++21901 DTAG HR
++22201 TIM IT
++22210 VDF IT
++22299 H3G IT
++22603 DTAG RO
++22606 DTAG RO
++22610 ORG RO
++23001 DTAG CZ
++23003 VDF CZ
++23102 DTAG SK
++23201 MBK AT
++23203 DTAG AT
++23205 H3G AT
++23207 DTAG TR
++23210 H3G AT
++23214 H3G AT
++23410 O2 GB
++23415 VDF GB
++23420 H3G GB
++23430 EEO GB
++23433 EEO GB
++23494 H3G GB
++23594 H3G GB
++24007 TELE2 SE
++25001 MTS RU
++25002 MGF RU
++25099 BEE RU
++26001 PLS PL
++26002 DTAG PL
++26003 ORG PL
++26006 P4P PL
++26098 P4P PL
++26201 DTAG DE
++26202 VDF DE
++26207 O2 DE
++26209 VDF DE
++26801 VDF PT
++28601 TRC TR
++28602 VDF TR
++28603 AVE TR
++28604 AVE TR
++29401 DTAG MK
++29702 DTAG ME
++302220 TLS CA
++302221 TLS CA
++302222 TLS CA
++302370 RGS CA
++302500 VTR CA
++302510 VTR CA
++302520 VTR CA
++302530 VTR CA
++302610 BELL CA
++302640 BELL CA
++302720 RGS CA
++302720 VTR CA
++310012 VZW US
++310120 TMO US
++310150 ATT US
++310170 ATT US
++310200 TMO US
++310210 TMO US
++310220 TMO US
++310230 TMO US
++310240 TMO US
++310250 TMO US
++310260 TMO US
++310270 TMO US
++310280 ATT US
++310310 TMO US
++310380 ATT US
++310410 ATT US
++310590 VZW US
++310660 TMO US
++310800 TMO US
++310890 VZW US
++311180 ATT US
++311270 VZW US
++311480 VZW US
++311490 TMO US
++311870 TMO US
++334020 TCL MX
++40492 ARTL IN
++405840 RJIL IN
++405854 RJIL IN
++405855 RJIL IN
++405856 RJIL IN
++405857 RJIL IN
++405858 RJIL IN
++405859 RJIL IN
++405860 RJIL IN
++405861 RJIL IN
++405862 RJIL IN
++405863 RJIL IN
++405864 RJIL IN
++405865 RJIL IN
++405866 RJIL IN
++405867 RJIL IN
++405868 RJIL IN
++405869 RJIL IN
++405870 RJIL IN
++405871 RJIL IN
++405872 RJIL IN
++405873 RJIL IN
++405874 RJIL IN
++42501 ORI IL
++42502 CCM IL
++42510 ORI IL
++44007 KDDI JP
++44008 KDDI JP
++44010 DCM JP
++44020 SBM JP
++44050 KDDI JP
++44051 KDDI JP
++44052 KDDI JP
++44053 KDDI JP
++44054 KDDI JP
++44055 KDDI JP
++44056 KDDI JP
++44070 KDDI JP
++44071 KDDI JP
++44072 KDDI JP
++44073 KDDI JP
++44074 KDDI JP
++44075 KDDI JP
++44076 KDDI JP
++44077 KDDI JP
++44078 KDDI JP
++44079 KDDI JP
++44088 KDDI JP
++44089 KDDI JP
++44170 KDDI JP
++45005 SKT KR
++45006 LGU KR
++45008 KT KR
++45400 CSL HK
++45402 CSL HK
++45403 H3G HK
++45406 SMT HK
++45410 CSL HK
++45412 CMHK HK
++45413 CMHK HK
++45415 SMT HK
++45416 PCCW HK
++45417 SMT HK
++45418 CSL HK
++45419 PCCW HK
++46000 CMCC CN
++46002 CMCC CN
++46007 CMCC CN
++46008 CMCC CN
++46601 FET TW
++46605 APT TW
++46689 TSTR TW
++46692 CHT TW
++46697 TWM TW
++50501 TEL AU
++50502 OPT AU
++51009 SMF ID
++51028 SMF ID
++52501 STL SG
++52503 MON SG
++52505 SHB SG
++64710 SFR RE
++65501 VDC ZA
++65507 CELC ZA
++65510 MTN ZA
++71401 CNW PA
++71610 CLR PE
++71617 ENT PE
++72402 TIM BR
++72403 TIM BR
++72404 TIM BR
++72406 VIV BR
++72410 VIV BR
++72411 VIV BR
++72423 VIV BR
++72489 VIV BR
++732101 CLR CO
+diff --git a/ims/ims.mk b/ims/ims.mk
+index b3560e91..d23a8412 100644
+--- a/ims/ims.mk
++++ b/ims/ims.mk
+@@ -33,6 +33,14 @@ PRODUCT_PACKAGES += \
+     ipsecstarter \
+     ipsecclient
+ 
++# Carrier profile selection (ims/Android.bp, ims/lge-ims-operator.sh). The IMS profile decides whether
++# REGISTER performs the security agreement, and stock selects it from the handset model, so a vs995
++# provisions a Verizon profile on any SIM and a P-CSCF requiring RFC 3329 answers 421. The map is
++# consulted by the script; an unmapped SIM keeps the stock target profile.
++PRODUCT_PACKAGES += \
++    lge-ims-operator.sh \
++    ims-operator-map.txt
++
+ # Ims4 is a priv-app requesting signature|privileged perms; without this allowlist system_server
+ # FATALs at onSystemReady (a framework check, not SELinux). Generated from aapt dump permissions.
+ PRODUCT_COPY_FILES += \
+diff --git a/ims/lge-ims-operator.rc b/ims/lge-ims-operator.rc
+new file mode 100644
+index 00000000..30334c4f
+--- /dev/null
++++ b/ims/lge-ims-operator.rc
+@@ -0,0 +1,12 @@
++# Set the LG IMS carrier profile preference as soon as the modem reports the SIM's network. Runs on
++# the property rather than at boot because gsm.sim.operator.numeric is empty until the SIM is read.
++# See lge-ims-operator.sh for why the profile choice decides the SIP security agreement.
++service lge_ims_operator /system/bin/lge-ims-operator.sh
++    class late_start
++    user system
++    group system
++    oneshot
++    disabled
++
++on property:gsm.sim.operator.numeric=*
++    start lge_ims_operator
+diff --git a/ims/lge-ims-operator.sh b/ims/lge-ims-operator.sh
+new file mode 100755
+index 00000000..70aa3cf6
+--- /dev/null
++++ b/ims/lge-ims-operator.sh
+@@ -0,0 +1,52 @@
++#!/system/bin/sh
++# Pick the LG IMS carrier profile from the SIM instead of the device model.
++#
++# Stock ties the profile to the handset: com.lge.os.Build.CA_TARGET is VZW/US on a vs995, so a
++# Verizon profile is provisioned whatever SIM is present. That profile sets aos_reg_0_ipsec=false,
++# the REGISTER carries no Security-Client, and any P-CSCF that requires RFC 3329 answers
++# "421 Extension Required" and registration ends blocked. The profile matching the SIM's own network
++# sets aos_reg_0_ipsec=true, so the security agreement runs and REGISTER reaches 200 OK.
++#
++# OperatorInfo reads persist.lg.ims.pref_operator and persist.lg.ims.pref_country in its static
++# initialiser and prefers them over the model target, which is the stock override used here. The
++# properties persist, so a boot where the SIM is read after the app has already initialised still
++# leaves the right value in place for the next one.
++#
++# An unmapped SIM leaves both properties untouched, which keeps the stock target behaviour.
++
++MAP=/system/etc/ims/ims-operator-map.txt
++[ -r "$MAP" ] || exit 0
++
++# An explicit choice wins and keeps winning. Without this the mapping is re-asserted on every boot,
++# so a SIM the map gets wrong cannot be corrected on the device at all: setting the preference by
++# hand lasts until the next reboot and no further. Set persist.lg.ims.pref_locked to true and this
++# stops touching the preference, leaving whatever is there, including nothing.
++case "$(getprop persist.lg.ims.pref_locked)" in
++  1|true|TRUE|yes) exit 0 ;;
++esac
++
++# The SIM's own network, not whatever it is roaming on, and the only one of the two with an
++# SELinux label of its own (gsm.operator.numeric falls through to default_prop).
++mccmnc="$(getprop gsm.sim.operator.numeric)"
++case "$mccmnc" in
++  ''|*[!0-9]*) exit 0 ;;
++esac
++
++entry="$(while read -r code op country _rest; do
++    case "$code" in ''|\#*) continue ;; esac
++    [ "$code" = "$mccmnc" ] && { echo "$op $country"; break; }
++  done < "$MAP")"
++[ -n "$entry" ] || exit 0
++
++op="${entry%% *}"
++country="${entry##* }"
++[ -n "$op" ] && [ -n "$country" ] || exit 0
++
++# Writing the same value again would make the app re-provision lgims.db for nothing.
++[ "$(getprop persist.lg.ims.pref_operator)" = "$op" ] &&
++  [ "$(getprop persist.lg.ims.pref_country)" = "$country" ] && exit 0
++
++# Deliberately silent: `log` would need write_logd on this domain for a line that
++# `getprop persist.lg.ims.pref_operator` and `getprop net.ims.operator` already answer.
++setprop persist.lg.ims.pref_operator "$op"
++setprop persist.lg.ims.pref_country "$country"
+diff --git a/sepolicy/private/file_contexts b/sepolicy/private/file_contexts
+index 2d6e43ac..86c42ef5 100644
+--- a/sepolicy/private/file_contexts
++++ b/sepolicy/private/file_contexts
+@@ -1,3 +1,6 @@
+ # LG IMS IPsec helpers (ims/Android.bp, lge_ims_ipsec.te)
+ /system/bin/ipsecstarter    u:object_r:ipsecstarter_exec:s0
+ /system/bin/ipsecclient     u:object_r:ipsecclient_exec:s0
++
++# Carrier profile selection (ims/Android.bp, lge_ims_operator.te)
++/system/bin/lge-ims-operator\.sh    u:object_r:lge_ims_operator_exec:s0
+diff --git a/sepolicy/private/lge_ims_operator.te b/sepolicy/private/lge_ims_operator.te
+new file mode 100644
+index 00000000..e6de965f
+--- /dev/null
++++ b/sepolicy/private/lge_ims_operator.te
+@@ -0,0 +1,24 @@
++# Carrier profile selection (ims/lge-ims-operator.rc, ims/lge-ims-operator.sh). A oneshot shell
++# service started when the modem publishes the SIM's network. It reads the MCCMNC, looks it up in
++# /system/etc/ims/ims-operator-map.txt and sets the two preference properties OperatorInfo reads to
++# choose which carrier profile provisions lgims.db. That choice is what decides whether the SIP
++# REGISTER performs the RFC 3329 security agreement, so getting it wrong costs IMS entirely.
++type lge_ims_operator, domain, coredomain;
++type lge_ims_operator_exec, exec_type, file_type, system_file_type;
++init_daemon_domain(lge_ims_operator)
++
++# init execs the script, the kernel then execs the interpreter, and the script calls getprop and
++# setprop. /system/bin/sh is shell_exec, but getprop and setprop are symlinks to /system/bin/toybox,
++# which is toolbox_exec, so naming system_file alone leaves them denied. Symlink traversal and
++# directory search over system_file come from the domain.te baseline. rx_file_perms on system_file
++# covers reading the map in /system/etc/ims.
++allow lge_ims_operator shell_exec:file rx_file_perms;
++allow lge_ims_operator toolbox_exec:file rx_file_perms;
++allow lge_ims_operator system_file:file execute_no_trans;
++allow lge_ims_operator system_file:file rx_file_perms;
++
++# persist.lg.ims.pref_operator and persist.lg.ims.pref_country (property_contexts -> lge_ims_prop)
++set_prop(lge_ims_operator, lge_ims_prop)
++
++# gsm.sim.operator.numeric and gsm.operator.numeric
++get_prop(lge_ims_operator, telephony_status_prop)

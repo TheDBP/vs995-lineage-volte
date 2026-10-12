@@ -1,0 +1,717 @@
+#!/usr/bin/env bash
+# bootstrap.sh — build a device's ROM in Docker: image -> init -> manifests -> sync -> features+patches
+# -> build. Run from a device repo root; per-device values from ./device.conf. Host needs only Docker.
+#   ./forge/bootstrap.sh                        # the first preset in device.conf
+#   PRESET=clean ./forge/bootstrap.sh           # a named set of options
+#   OPTIONS="gapps root" ./forge/bootstrap.sh   # an ad-hoc set
+# One run builds one image.
+#   JOBS=8  SYNC_JOBS="4 2 1"  BUILD_ROOT=/path  # overrides
+# JOBS defaults to physical cores minus two (floor 4), capped by MemTotal/2, leaving the
+# machine usable while a build runs. Set it to use the whole box.
+# Every sync writes build_output/manifests/manifest-<stamp>.xml with each project pinned to the SHA
+# it was built from, and manifests/latest.xml points at the newest. PIN_MANIFEST=<file> syncs back
+# to one of those, which is the only way to tell an upstream change from a local one.
+#   SOONG_MEM_LIMIT=20GiB                        # cap soong_build's heap on a small machine
+# JOBS sizes the COMPILE phase. It does nothing for analysis: soong_build is one process whose
+# peak is set by the build graph (~30 GB live on a 24.0 tree, 60 GB at the Go default of a 2x
+# heap), so on a 32 GB box the fix is SOONG_MEM_LIMIT, not a lower JOBS. It only reaches
+# soong_build through patches/<branch>/build/soong (soong_ui starts it with `env -i`).
+# OEM builds (the oem option) need a stock ROM: STOCK_ROM=path, a zip matching STOCK_ROM_GLOB, or STOCK_ROM_URL.
+set -euo pipefail
+
+FORGE="$(cd "$(dirname "$0")" && pwd)"            # .../<device repo>/forge
+
+# --device <name>: in-place layout. Device config and patches under devices/<name>/ instead of a
+# separate repo. aosp.sh layers the engine over /repo/forge, so container paths are unchanged.
+INPLACE_DEVICE=""
+_args=(); while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --device) INPLACE_DEVICE="${2:?--device needs a name}"; shift 2 ;;
+    # Everything else is configuration, not flags -- but an unrecognised argument used to be
+    # collected, ignored, and the build started anyway. `./bootstrap.sh --help` therefore began a
+    # container build and a ~100 GB sync, which is an expensive way to ask a question.
+    -h|--help)
+      cat <<'USAGE'
+bootstrap.sh -- build one ROM image.
+
+  PRESET=<name>  ./forge/bootstrap.sh     a saved option set from device.conf
+  OPTIONS="a b"  ./forge/bootstrap.sh     pick options directly (replaces the preset's set)
+  EXTRA_OPTIONS="a b" PRESET=<name> ..   add options to a preset (space or comma separated)
+  ./forge/bootstrap.sh                    the first preset in device.conf
+
+  --device <name>    build devices/<name>/ inside a rom-forge clone instead of a device repo
+
+Configuration is environment and device.conf, not flags: JOBS, KEEP_GOING, BUILD_ROOT,
+TURBO_BUILD_ID, KEYS_DIR, FDROID_PINS, STOCK_ROM, SOONG_MEM_LIMIT. See forge/README.md and
+forge/device.conf.example.
+USAGE
+      exit 0 ;;
+    -*) echo "!! unknown option: $1 -- bootstrap takes configuration from the environment and" >&2
+        echo "   device.conf, not flags. Try --help." >&2; exit 2 ;;
+    *)        _args+=("$1"); shift ;;
+  esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+if [ -n "$INPLACE_DEVICE" ]; then
+  DEVICE_REPO="$FORGE/devices/$INPLACE_DEVICE"
+  [ -d "$DEVICE_REPO" ] || {
+    echo "!! no device at $DEVICE_REPO" >&2
+    echo "   create it:  ./tools/new-device-repo.sh --codename <codename> --device $INPLACE_DEVICE" >&2
+    [ -d "$FORGE/devices" ] && { echo "   existing:"; ls -1 "$FORGE/devices" 2>/dev/null | sed 's/^/     /'; } >&2
+    exit 1
+  }
+  export FORGE_DEVICE_REPO="$DEVICE_REPO"      # aosp.sh cannot derive this from its own path
+else
+  DEVICE_REPO="$(cd "$FORGE/.." && pwd)"        # device repo root
+fi
+OVL="$DEVICE_REPO/overlay"                        # device overlay (same definition as forge/tools/*.sh)
+# Run from a bare clone rather than a device repo: the engine expects <device-repo>/forge/, so
+# DEVICE_REPO resolves to the clone's parent, where no device.conf can exist.
+if [ ! -f "$DEVICE_REPO/device.conf" ] && [ -x "$FORGE/tools/new-device-repo.sh" ] && [ -d "$FORGE/kernel-configs" ]; then
+  cat >&2 <<'ONBOARD'
+This is a rom-forge clone. The forge is the build engine; each device gets its own repo beside it
+holding that device's config and patches.
+
+Create one:
+
+    ./tools/new-device-repo.sh --codename <codename> ~/<name>-android
+
+Codename is what the device reports, not the marketing name:
+
+    adb shell getprop ro.product.device        # or: fastboot getvar product
+
+With a device connected, --codename can be omitted.
+
+Then:
+
+    cd ~/<name>-android && ./bootstrap.sh
+
+Or build in place: ./tools/new-device-repo.sh --device <name> && ./bootstrap.sh --device <name>
+
+See README.md, "Setting up a device".
+ONBOARD
+  exit 1
+fi
+[ -f "$DEVICE_REPO/device.conf" ] || { echo "!! no device.conf at $DEVICE_REPO — copy forge/device.conf.example"; exit 1; }
+source "$DEVICE_REPO/device.conf"
+# Personal, per-checkout settings. Gitignored, so it never reaches the published repo: this is where
+# "every build on this checkout also wants the reclaimed OEM assets" belongs, as EXTRA_OPTIONS="oem". Sourced
+# after device.conf so it can override anything there, and applies to whichever preset you build
+# rather than needing an -oem twin of each one. Anything it adds is reflected in the build tag.
+[ -f "$DEVICE_REPO/device.conf.local" ] && source "$DEVICE_REPO/device.conf.local"
+# The friendly onboarding block above only fires when device.conf is ABSENT. The device template
+# SHIPS one with every identity key blank, so the commonest first run -- clone the template, read
+# "What you can build", run it -- landed on a bare "DEVICE: parameter null or not set" with nothing
+# pointing back at start-here.sh.
+_blank=""
+for _k in DEVICE DEVICE_CODENAME DEVICE_SLUG BRANCH LUNCH_TARGET; do
+  [ -n "${!_k:-}" ] || _blank="$_blank $_k"
+done
+if [ -n "$_blank" ]; then
+  echo "!! device.conf has not been filled in yet -- still blank:$_blank" >&2
+  echo "   Run ./start-here.sh, which works out your phone and fills these in." >&2
+  echo "   Or set them by hand in $DEVICE_REPO/device.conf (see forge/device.conf.example)." >&2
+  exit 1
+fi
+: "${DEVICE:?}" "${DEVICE_CODENAME:?}" "${DEVICE_SLUG:?}" "${BRANCH:?}" "${LUNCH_TARGET:?}"
+: "${UBUNTU_VER:=20.04}" "${JDK_VER:=11}" "${MANIFEST_URL:=https://github.com/LineageOS/android.git}"
+
+BUILD_ROOT="${BUILD_ROOT:-$DEVICE_REPO/build_output}"   # everything (tree, ccache, logs, fetched zips); gitignored
+SRC="$BUILD_ROOT/src"
+FORGE_DIR="$FORGE"; export FORGE_DIR
+source "$FORGE/lib/presets.sh"
+
+IMG="aosp-${DEVICE_SLUG}:${UBUNTU_VER}"
+
+# One run builds one image. PRESET names a saved set of options; OPTIONS gives one directly.
+# Neither given -> the first preset, which is the ordinary build for this device.
+if [ -z "${OPTIONS:-}" ] && [ -z "${PRESET:-}" ]; then
+  PRESET="$(forge_preset_names | sed -n 1p)"
+  [ -n "$PRESET" ] || { echo "!! device.conf defines no PRESETS, and neither PRESET nor OPTIONS was given" >&2; exit 1; }
+fi
+if [ -n "${PRESET:-}" ]; then
+  forge_preset_tag "$PRESET" >/dev/null || {
+    echo "!! no preset '$PRESET' (PRESETS defines: $(forge_preset_names | tr '\n' ' '))" >&2; exit 1; }
+  forge_preset_validate "$PRESET" || exit 1
+  # The tag is derived HERE, where EXTRA_OPTIONS (and device.conf.local) are visible. The container
+  # never sees them, so deriving it there silently dropped the -oem suffix from the filename.
+  TURBO_BUILD_ID="${TURBO_BUILD_ID:-$(forge_preset_tag "$PRESET")}"
+else
+  # An ad-hoc OPTIONS= set has no preset tag, and before this it fell through to whatever the device
+  # defaults to -- so OPTIONS="oem" produced an image called turbo-ether.zip: indistinguishable from
+  # the full preset and silent about carrying reclaimed OEM assets. Derive it from the options, for the
+  # same reason the preset tags are derived here rather than in the container.
+  TURBO_BUILD_ID="${TURBO_BUILD_ID:-$(forge_adhoc_tag "$OPTIONS")}"
+fi
+BUILD_OPTIONS="${OPTIONS:-$(forge_preset_options "${PRESET:-}")}"
+BUILD_OPTIONS="${BUILD_OPTIONS//,/ }"
+# REQUIRES in an option.conf pulls in another option, so a pairing that only makes sense together
+# does not depend on every preset remembering it (root without a terminal being the case in point).
+# One pass is deliberate: a chain deep enough to need recursion means the options are wrong.
+for _o in $BUILD_OPTIONS; do
+  _req=$(sed -n 's/^REQUIRES=//p' "$FORGE/options/$_o/option.conf" 2>/dev/null | tr -d '"' | tr ',' ' ')
+  for _r in $_req; do
+    case " $BUILD_OPTIONS " in
+      *" $_r "*) ;;
+      *) [ -d "$FORGE/options/$_r" ] || { echo "!! option $_o REQUIRES '$_r', which does not exist" >&2; exit 1; }
+         echo "   option $_o requires $_r -- adding it"
+         BUILD_OPTIONS="$BUILD_OPTIONS $_r" ;;
+    esac
+  done
+done
+# ---- volte: on when this checkout can build it, off when it cannot, silent never ----------------
+# VoLTE on a ported device is the manufacturer's own IMS stack, rebuilt from firmware the user
+# supplies and that no repo may redistribute. So it cannot be unconditionally on -- a fresh clone
+# would not build at all -- and it must not be quietly off, because that is "same command, same
+# repo, two different images", which is the exact failure options/README.md's sub-switch rule and
+# the Robin's device.mk staging were both written against.
+#
+# Hence three states rather than two. Asked for and unbuildable stops the build: an explicit request
+# is never silently downgraded. Not asked for and buildable turns it on, because nobody who supplied
+# their phone's firmware wanted a phone that cannot make calls. Not asked for and unbuildable turns
+# it off, says so in terms that matter to the person holding the phone, and marks the tag -- the
+# absence is the surprising artifact here, so the absence is what the filename records.
+if [ -n "${VOLTE_STOCK_GLOB:-}" ] || [ -n "${VOLTE_STAGED_MARKER:-}" ]; then
+  _volte_have=""
+  for _c in "$DEVICE_REPO"/${VOLTE_STOCK_GLOB:-__none__} "$BUILD_ROOT"/${VOLTE_STOCK_GLOB:-__none__}; do
+    [ -e "$_c" ] && { _volte_have="$(basename "$_c")"; break; }
+  done
+  # Staged by an earlier build counts: the stock input only ever existed to produce those artifacts,
+  # and requiring it forever would mean keeping a multi-gigabyte image around to rebuild.
+  if [ -z "$_volte_have" ] && [ -n "${VOLTE_STAGED_MARKER:-}" ] && [ -e "$SRC/$VOLTE_STAGED_MARKER" ]; then
+    _volte_have="already staged"
+  fi
+  case " $BUILD_OPTIONS " in
+    *" volte "*)
+      if [ -z "$_volte_have" ]; then
+        echo "!! volte was asked for, but there is no ${VOLTE_STOCK_GLOB:-stock firmware} in $DEVICE_REPO or $BUILD_ROOT" >&2
+        echo "!! and nothing staged in the tree." >&2
+        echo "!! VoLTE is the manufacturer's IMS stack rebuilt from the phone's own firmware; it" >&2
+        echo "!! cannot be built from source and cannot ship in this repo. See the VoLTE/IMS doc." >&2
+        echo "!! Refusing to build an image tagged for VoLTE that would not have it." >&2
+        exit 1
+      fi
+      echo ">> volte: on (asked for) -- $_volte_have" ;;
+    *)
+      if [ -n "$_volte_have" ]; then
+        BUILD_OPTIONS="$BUILD_OPTIONS volte"
+        echo ">> volte: on -- $_volte_have"
+      else
+        echo ">> volte: OFF -- no ${VOLTE_STOCK_GLOB:-stock firmware} found in $DEVICE_REPO or $BUILD_ROOT"
+        echo "   This image will NOT be able to place calls over LTE. Carriers have been shutting"
+        echo "   down the 2G/3G voice these devices fall back to, so on many networks that means no"
+        echo "   calls at all. Supply the stock firmware to get VoLTE; see the VoLTE/IMS doc."
+        TURBO_BUILD_ID="${TURBO_BUILD_ID}-novolte"
+      fi ;;
+  esac
+fi
+
+# Signing is a per-checkout choice (device.conf.local), so say which one this build gets.
+if [ -n "${KEYS_DIR:-}" ]; then echo ">> signing: release keys from $KEYS_DIR"
+else echo ">> signing: AOSP test keys (set KEYS_DIR in device.conf.local for a publishable image)"; fi
+
+# Parallelism: default to physical cores minus two, floored at four, then capped by memory.
+#
+# Physical cores, not nproc. nproc counts SMT threads, and a second thread on the same core buys
+# very little for javac/kotlinc/r8 while costing another 2-3 GB of heap -- so counting threads
+# roughly doubles the job count for no throughput. Minus two leaves the machine usable for other
+# work while a build runs, which is the common case; set JOBS to use the whole box.
+#
+# The memory cap stays and can take it below the floor: on a machine short of RAM, fewer jobs is
+# right even if it means two. Running out of memory does not fail cleanly, it thrashes -- a build
+# here sat at 16 targets/min with si=121128 so=343050, where the same tree at fewer jobs does not
+# swap at all.
+if [ -z "${JOBS:-}" ]; then
+  # Physical cores. lscpu first; /proc/cpuinfo core id + physical id pairs if it is absent, which
+  # is the same count without needing util-linux. nproc is the last resort only, and it counts
+  # threads, so say so rather than silently sizing the build off the wrong number.
+  _phys="$(lscpu -p=Core,Socket 2>/dev/null | grep -v '^#' | sort -u | wc -l)"
+  case "$_phys" in ''|0)
+    _phys="$(awk -F: '/^physical id/{p=$2} /^core id/{print p":"$2}' /proc/cpuinfo 2>/dev/null | sort -u | wc -l)" ;;
+  esac
+  case "$_phys" in ''|0)
+    _phys="$(nproc)"
+    echo "   note: no physical core count available, sizing JOBS off $_phys threads" ;;
+  esac
+  _corejobs=$(( _phys - 2 )); [ "$_corejobs" -lt 4 ] && _corejobs=4
+  # MemTotal, not MemAvailable: available is whatever happens to be free at launch, so the default
+  # would swing with unrelated load -- on this host it read 27G idle and 7G with a build already
+  # running, i.e. JOBS 13 or 3 for the same machine. Total is a property of the box.
+  _ramgb="$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo 2>/dev/null || echo 8)"
+  _ramjobs=$(( _ramgb / 2 )); [ "$_ramjobs" -lt 1 ] && _ramjobs=1
+  JOBS=$(( _corejobs < _ramjobs ? _corejobs : _ramjobs ))
+fi
+export BUILD_ROOT
+# aosp.sh turns SOONG_MEM_LIMIT into the container's GOMEMLIMIT, but only sees it if it is in
+# the environment. Exporting it here lets device.conf carry the value instead of every caller
+# having to remember it on the command line: a device whose analysis OOMs needs the limit on
+# every run, not on the runs where someone typed it.
+[ -n "${SOONG_MEM_LIMIT:-}" ] && export SOONG_MEM_LIMIT
+
+echo "== $DEVICE_CODENAME ROM bootstrap ($BRANCH) =="
+echo "   device repo: $DEVICE_REPO"
+echo "   build root:  $BUILD_ROOT"
+echo "   building:    ${PRESET:-<ad-hoc>}  [${BUILD_OPTIONS:-no options}]"
+echo "   jobs:        $JOBS"
+[ -n "${SOONG_MEM_LIMIT:-}" ] && echo "   soong heap:  $SOONG_MEM_LIMIT (GOMEMLIMIT)"
+echo
+
+# ---- preflight ----
+command -v docker >/dev/null || { echo "!! Docker not installed"; exit 1; }
+docker info >/dev/null 2>&1 || { echo "!! can't talk to the Docker daemon — are you in the 'docker' group (re-login after usermod)?"; exit 1; }
+mkdir -p "$BUILD_ROOT"  # ensure it exists first — the df space-check below trips set -e/pipefail if not
+avail=$(df -PBG "$BUILD_ROOT" 2>/dev/null | awk 'NR==2{gsub(/G/,"",$4);print $4}')
+if [ "${avail:-0}" -lt 250 ] 2>/dev/null; then
+  echo "!! warning: only ${avail:-?}G free at $BUILD_ROOT — a full build wants ~250G. Ctrl-C to bail."; sleep 5
+fi
+mkdir -p "$SRC"
+
+AOSP="$FORGE/docker/aosp.sh"                        # the container runner (per-device via device.conf)
+
+# ---- 0. fetch pinned Magisk (verified) for the pre-root boot patch ----
+echo ">> [0/5] fetching pinned Magisk APK (sha256-verified)"
+bash "$FORGE/prebuilt/fetch-magisk.sh"
+
+# ---- 1. docker image ----
+# SKIP_IMAGE_BUILD=1 reuses an existing image instead of rebuilding it. Editing the
+# Dockerfile for one device invalidates the layer cache for every Ubuntu version it
+# supports, so an unrelated change can force a full apt install -- and a distro
+# archive that is slow, throttled or briefly unreachable then blocks the build
+# entirely. Ubuntu 20.04 took 4528s to fail on a single .deb this way.
+if [ "${SKIP_IMAGE_BUILD:-0}" = "1" ] && docker image inspect "$IMG" >/dev/null 2>&1; then
+  echo ">> [1/5] reusing existing image $IMG (SKIP_IMAGE_BUILD=1)"
+else
+  echo ">> [1/5] building image $IMG (ubuntu $UBUNTU_VER + JDK $JDK_VER; uid/gid $(id -u):$(id -g))"
+  if ! docker build --build-arg UBUNTU_VER="$UBUNTU_VER" --build-arg JDK_VER="$JDK_VER" \
+      --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" -t "$IMG" "$FORGE/docker"; then
+    if docker image inspect "$IMG" >/dev/null 2>&1 && [ "${STRICT_IMAGE:-0}" != "1" ]; then
+      echo "!! ---------------------------------------------------------------------"
+      echo "!! Image build FAILED, but $IMG already exists -- continuing with it."
+      echo "!!"
+      echo "!! Usually a distro mirror being slow or briefly unreachable. Note that"
+      echo "!! editing the Dockerfile for ONE device invalidates the layer cache for"
+      echo "!! every Ubuntu version it supports, so an unrelated change can force a"
+      echo "!! full apt install here."
+      echo "!!"
+      echo "!! If you changed the Dockerfile and NEED those changes, the image in use"
+      echo "!! is stale. Re-run with STRICT_IMAGE=1 to fail instead of falling back."
+      echo "!! ---------------------------------------------------------------------"
+      docker image inspect -f '   using image built {{.Created}}' "$IMG" 2>/dev/null || true
+    else
+      echo "!! image build failed and no usable $IMG exists."
+      exit 1
+    fi
+  fi
+fi
+echo "   logs: $BUILD_ROOT/logs/  (Portainer container: aosp-${DEVICE_SLUG})"
+
+# ---- 2. repo init + manifests ----
+# REPO_REFERENCE: shared git object store (one object store shared by every repo) so a second
+# device on the same branch downloads only what differs. Identity-mounted by aosp.sh. Only applies
+# at `repo init` time, and the reference stays load-bearing afterwards: every borrowing project keeps an
+# absolute path to it in git's alternates files, so deleting the reference tree breaks this one.
+#
+# `repo sync --dissociate` does not exist -- --dissociate is a `repo init` flag, and on an
+# already-synced tree re-running init with it fails with "pack has N unresolved deltas". Set
+# REPO_DISSOCIATE=1 instead; the step after sync detaches this tree for real.
+REF_ARG=""
+# An ALREADY-INITIALISED tree records its reference in git's alternates files, and git stores those
+# as ABSOLUTE paths. If that path is not mounted at the same location inside the container, sync dies
+# with a message that looks like a network fault but is not:
+#   error: unable to normalize alternate object path: /.../build_output/src/.repo/project-objects/...
+#   fatal: pack has N unresolved deltas
+# Nothing records the reference in device.conf, so re-running a build without REPO_REFERENCE set used
+# to fail this way every time (bonito and vs995 both did). Recover it from the tree itself.
+if [ -z "${REPO_REFERENCE:-}" ] && [ -d "$SRC/.repo" ]; then
+  _alt="$SRC/.repo/manifests.git/objects/info/alternates"
+  if [ -f "$_alt" ]; then
+    _ref="$(sed -n '1p' "$_alt" 2>/dev/null | sed 's#/\.repo/.*##')"
+    if [ -n "$_ref" ] && [ -d "$_ref/.repo" ] && [ "$_ref" != "$SRC" ]; then
+      REPO_REFERENCE="$_ref"
+      echo "   detected existing git-object reference: $REPO_REFERENCE"
+    fi
+  fi
+fi
+if [ -n "${REPO_REFERENCE:-}" ]; then
+  [ -d "$REPO_REFERENCE" ] || { echo "!! REPO_REFERENCE=$REPO_REFERENCE does not exist"; exit 1; }
+  export MIRROR_DIR="$REPO_REFERENCE"
+  REF_ARG="--reference=$REPO_REFERENCE"
+  echo "   borrowing git objects from: $REPO_REFERENCE"
+fi
+echo ">> [2/5] repo init ($BRANCH) + install local_manifests"
+LOG_TAG=init "$AOSP" bash -lc "
+  cd /aosp
+  [ -d .repo ] || repo init -u $MANIFEST_URL -b $BRANCH --git-lfs $REF_ARG
+  BUILD_OPTIONS='${BUILD_OPTIONS:-}' /repo/forge/tools/apply-overlay.sh --manifests-only /aosp
+"
+
+# ---- 2.5. resolve inputs BEFORE sync (so downloads can be prefetched in parallel) ----
+# GApps are ANDROID-VERSION specific, and getting it wrong is SILENT: the build succeeds, the apps
+# install, they are simply built for another platform. This used to be a single hardcoded Android-11
+# URL, so any device that did not set GAPPS_URL itself got Android 11 GApps whatever it was building
+# -- ether/lineage-19.1 (Android 12.1) shipped that way for its whole life.
+#
+# Resolve the ANDROID VERSION, not the branch: BRANCH naming is ROM-specific (lineage-22.2,
+# android-15.0.0_r1, 15.0, bka, fourteen, ...) and the forge is not only for LineageOS. Order:
+#   1. ANDROID_VERSION in device.conf                -- explicit, ROM-agnostic, always correct
+#   2. derived from BRANCH for recognised naming   -- convenience for LineageOS and plain AOSP
+#   3. otherwise fail and ask                        -- never guess
+android_version_for_branch() {
+  case "$1" in
+    lineage-18.*)  echo 11 ;;
+    lineage-19.1)  echo 12.1 ;;    # 19.1 is Android 12.1 (12L); NikGapps ships 12 and 12.1 apart
+    lineage-19.*)  echo 12 ;;
+    lineage-20.*)  echo 13 ;;
+    lineage-21.*)  echo 14 ;;
+    lineage-22.*)  echo 15 ;;
+    lineage-23.*)  echo 16 ;;
+    lineage-24.*)  echo 17 ;;
+    android-*)     v="${1#android-}"; echo "${v%%.*}" ;;   # AOSP tags: android-15.0.0_r1 -> 15
+    *)             return 1 ;;
+  esac
+}
+
+_NIKGAPPS_BASE="https://sourceforge.net/projects/nikgapps/files/Releases"
+nikgapps_url_for_version() {
+  case "$1" in
+    11)   echo "$_NIKGAPPS_BASE/Android-11/13-Aug-2024/NikGapps-full-arm64-11-20240813-signed.zip/download" ;;
+    12)   echo "$_NIKGAPPS_BASE/Android-12/31-Dec-2024/NikGapps-full-arm64-12-20241231-signed.zip/download" ;;
+    12.1) echo "$_NIKGAPPS_BASE/Android-12.1/04-Feb-2026/NikGapps-full-arm64-12.1-20260204-signed.zip/download" ;;
+    13)   echo "$_NIKGAPPS_BASE/Android-13/04-Feb-2026/NikGapps-full-arm64-13-20260204-signed.zip/download" ;;
+    14)   echo "$_NIKGAPPS_BASE/Android-14/04-Feb-2026/NikGapps-full-arm64-14-20260204-signed.zip/download" ;;
+    15)   echo "$_NIKGAPPS_BASE/Android-15/04-Feb-2026/NikGapps-full-arm64-15-20260204-signed.zip/download" ;;
+    16)   echo "$_NIKGAPPS_BASE/Android-16/22-Feb-2026/NikGapps-full-arm64-16-20260222-signed.zip/download" ;;
+    *)    return 1 ;;
+  esac
+}
+
+# Which sync-time downloads this build needs. Both are options, so this is just membership of the
+# resolved set -- no second table to keep in step with the first. The app options (firefox, fdroid,
+# k9, ...) fetch their own APKs from apply-overlay, after the tree exists: which build to take is
+# resolved against F-Droid at that point, so there is nothing to prefetch.
+WANT_OEM=false; WANT_GAPPS=false
+for _o in $BUILD_OPTIONS; do
+  case "$_o" in oem) WANT_OEM=true ;; gapps) WANT_GAPPS=true ;; esac
+done
+# OEM_ASSET_PACK names which manufacturer asset pack to reclaim, not a yes/no. Unset or
+# "none" means this build bakes no OEM assets. "nextbit-robin" is the only pack that exists
+# today; any device may select it (the Pixel borrows the Robin boot animation), because the
+# constraint is the stock ROM you feed it, not the device being built.
+case "${OEM_ASSET_PACK:-none}" in
+  nextbit-robin) OEM_EXTRACTOR=extract-nextbit-oem-assets.sh ;;
+  none|false|"")  WANT_OEM=false ;;
+  *) echo "!! unknown OEM_ASSET_PACK $OEM_ASSET_PACK (known: nextbit-robin)"; exit 1 ;;
+esac
+
+STOCK_DL_URL=""
+if [ "$WANT_OEM" = true ]; then
+  if [ -n "${STOCK_ROM:-}" ]; then
+    [ -f "$STOCK_ROM" ] || { echo "!! STOCK_ROM=$STOCK_ROM does not exist" >&2; exit 1; }
+  else
+    for c in "$PWD"/${STOCK_ROM_GLOB:-Stock_ROM_*.zip} "$DEVICE_REPO"/${STOCK_ROM_GLOB:-Stock_ROM_*.zip} "$BUILD_ROOT"/${STOCK_ROM_GLOB:-Stock_ROM_*.zip}; do
+      [ -f "$c" ] && STOCK_ROM="$c" && break
+    done
+  fi
+  if [ -z "${STOCK_ROM:-}" ]; then
+    if [ -n "${STOCK_ROM_URL:-}" ]; then STOCK_DL_URL="$STOCK_ROM_URL"
+    else
+      echo "!! OEM build requested but no stock ROM found. Pass STOCK_ROM=/path, drop ${STOCK_ROM_GLOB:-a stock zip} in $PWD, or set STOCK_ROM_URL=... . Failing." >&2
+      exit 1
+    fi
+  fi
+fi
+
+GAPPS_DL_URL=""
+# WITH_GAPPS_EXTRAS=false narrows gapps to MindTheGapps: Play Store and GMS from the manifest
+# repo, and none of the Google app swaps, which are what the NikGapps zip supplies. It exists for
+# an Android version NikGapps has not released for yet. Explicit per device, never inferred: a
+# build that quietly drops the swaps looks identical until the phone is in your hand, which is
+# the failure the check below exists for. options/gapps/require.sh reads the same switch.
+if [ "$WANT_GAPPS" = true ] && [ "${WITH_GAPPS_EXTRAS:-true}" != true ]; then
+  echo "   GApps: MindTheGapps only (WITH_GAPPS_EXTRAS=false) -- no Google app swaps"
+  WANT_GAPPS=false
+fi
+if [ "$WANT_GAPPS" = true ]; then
+  if [ -n "${GAPPS_ZIP:-}" ]; then
+    [ -f "$GAPPS_ZIP" ] || { echo "!! GAPPS_ZIP=$GAPPS_ZIP does not exist" >&2; exit 1; }
+  else
+    for c in "$PWD"/NikGapps*.zip "$PWD"/*[Gg][Aa]pps*.zip "$DEVICE_REPO"/*[Gg][Aa]pps*.zip "$BUILD_ROOT"/*[Gg][Aa]pps*.zip; do
+      [ -f "$c" ] && GAPPS_ZIP="$c" && break
+    done
+  fi
+  if [ -z "${GAPPS_ZIP:-}" ]; then
+    if [ -n "${GAPPS_URL:-}" ]; then
+      GAPPS_DL_URL="$GAPPS_URL"                       # explicit per-device override wins
+    else
+      _av="${ANDROID_VERSION:-$(android_version_for_branch "$BRANCH" || true)}"
+      if [ -z "$_av" ]; then
+        echo "!! cannot tell which Android version BRANCH=$BRANCH is." >&2
+        echo "!! The forge is not LineageOS-only, so branch names are not a reliable signal." >&2
+        echo "!! Set ANDROID_VERSION (e.g. ANDROID_VERSION=15) or GAPPS_URL in device.conf." >&2
+        exit 1
+      fi
+      if ! GAPPS_DL_URL="$(nikgapps_url_for_version "$_av")"; then
+        echo "!! no NikGapps release mapped for Android $_av." >&2
+        echo "!! Add it to nikgapps_url_for_version() in forge/bootstrap.sh, or set GAPPS_URL." >&2
+        echo "!! Refusing to guess -- the wrong version's GApps installs silently and only" >&2
+        echo "!! shows up on the device." >&2
+        exit 1
+      fi
+      echo "   GApps: Android $_av -> $(basename "${GAPPS_DL_URL%/download}")"
+    fi
+  fi
+fi
+# ---- 3. reset patched projects (feature targets + device patches), then prefetch + sync ----
+# Compute the full set of projects the local commits touch so repo sync can check them out clean.
+RESET_PROJECTS="${PATCHED_PROJECTS:-}"
+[ -d "$OVL/patches" ] && RESET_PROJECTS="$RESET_PROJECTS $(cd "$OVL/patches" && find . -name '*.patch' -printf '%h\n' | sed 's#^\./##' | sort -u)"
+# Projects the enabled options patch. Derived from the directory layout -- patches/<project>/*.patch
+# -- exactly as the device patches above are, so an option has no TARGETS field to declare and
+# therefore no way for it to disagree with what is actually on disk.
+for _o in ${BUILD_OPTIONS:-}; do
+  _od="$FORGE/options/$_o/patches/$BRANCH"
+  [ -d "$_od" ] && RESET_PROJECTS="$RESET_PROJECTS $(cd "$_od" && find . -name '*.patch' -printf '%h\n' | sed 's#^\./##' | sort -u)"
+done
+RESET_PROJECTS=$(printf '%s\n' $RESET_PROJECTS | sort -u | tr '\n' ' ')
+# Blobs edited in place by overlay/blob-fixups leave their project dirty without a commit, which is
+# the one state repo sync refuses to touch. The list names files, not projects, and the project
+# boundary is only known inside the tree, so resolve each path to its git toplevel there.
+BLOBFIX_PATHS=""
+[ -f "$OVL/blob-fixups" ] && BLOBFIX_PATHS=$(awk '!/^[[:space:]]*(#|$)/ {print $1}' "$OVL/blob-fixups" | sort -u | tr '\n' ' ')
+echo ">> [3/5] reset patched projects so repo sync can check them out: $RESET_PROJECTS"
+LOG_TAG=reset "$AOSP" bash -lc "
+  for p in $RESET_PROJECTS; do
+    d=/aosp/\$p; [ -d \"\$d/.git\" ] || continue
+    git -C \"\$d\" am --abort 2>/dev/null
+    git -C \"\$d\" reset --hard >/dev/null 2>&1 && echo \"   reset \$p\"
+  done
+  for f in $BLOBFIX_PATHS; do
+    d=\$(git -C \"/aosp/\$(dirname \"\$f\")\" rev-parse --show-toplevel 2>/dev/null) || continue
+    git -C \"\$d\" diff --quiet 2>/dev/null && continue
+    git -C \"\$d\" reset --hard >/dev/null 2>&1 && echo \"   reset \${d#/aosp/} (blob-fixups)\"
+  done; exit 0"
+
+DL="$BUILD_ROOT/dl"; mkdir -p "$DL"
+echo ">> [3/5] prefetch downloads in background (overlapping sync) -> $DL"
+( DL_DIR="$DL" CONTAINER=aosp-${DEVICE_SLUG}-prefetch LOG_TAG=prefetch "$AOSP" bash -lc \
+    "STOCK_DL_URL='$STOCK_DL_URL' GAPPS_DL_URL='$GAPPS_DL_URL' /repo/forge/docker/prefetch.sh" ) &
+PREFETCH_PID=$!
+
+# PIN_MANIFEST=<file> rebuilds the exact tree a previous build used. The snapshot from [3a] is a
+# manifest with every project pinned to a SHA, so installing it as the local manifest override and
+# syncing puts upstream back where it was. This is what makes an A/B meaningful: without it, a
+# rebuild of an older commit of this repo still pulls today's upstream, so a difference cannot be
+# attributed to either side.
+if [ -n "${PIN_MANIFEST:-}" ]; then
+  [ -f "$PIN_MANIFEST" ] || { echo "!! PIN_MANIFEST=$PIN_MANIFEST does not exist" >&2; exit 1; }
+  echo ">> [3/5] pinning upstream to $(basename "$PIN_MANIFEST") ($(grep -c "<project" "$PIN_MANIFEST") projects)"
+  cp "$PIN_MANIFEST" "$SRC/.repo/manifests/pinned.xml"
+  # `repo manifest -r` writes EVERY project it can see, including the ones local_manifests add, so
+  # the snapshot is already the complete set. Leaving the local manifests in place declares those
+  # projects a second time and repo rejects the whole manifest:
+  #   fatal: duplicate path vendor/gapps in /aosp/.repo/manifests/pinned.xml
+  # Dropping them is safe because [2/5] regenerates them from the option set on every run.
+  rm -rf "$SRC/.repo/local_manifests"
+  LOG_TAG=sync CONTAINER=aosp-${DEVICE_SLUG}-sync "$AOSP" \
+    bash -lc "cd /aosp && repo init -m pinned.xml" || { echo "!! repo init -m pinned.xml failed" >&2; exit 1; }
+elif [ -f "$SRC/.repo/manifests/pinned.xml" ]; then
+  # A previous build pinned this checkout, and repo remembers the override in its own config.
+  # [2/5] only runs `repo init` when .repo does not exist yet, so without this every later build
+  # silently keeps syncing the old pin while reporting nothing unusual.
+  echo ">> [3/5] clearing a previous PIN_MANIFEST (back to default.xml)"
+  rm -f "$SRC/.repo/manifests/pinned.xml"
+  LOG_TAG=sync CONTAINER=aosp-${DEVICE_SLUG}-sync "$AOSP" \
+    bash -lc "cd /aosp && repo init -m default.xml" || { echo "!! repo init -m default.xml failed" >&2; exit 1; }
+fi
+
+echo ">> [3/5] repo sync — hours + ~100GB the first time (progress in logs/sync.log)"
+sync_ok=false
+for sj in ${SYNC_JOBS:-8 6 4 2 1}; do
+  echo "   repo sync -j$sj"
+  if LOG_TAG=sync CONTAINER=aosp-${DEVICE_SLUG}-sync "$AOSP" bash -lc "cd /aosp && repo sync -c -j$sj --force-sync --no-clone-bundle"; then
+    sync_ok=true; break
+  fi
+  echo "!! sync failed at -j$sj (often HTTP 429 throttling) — retrying at lower parallelism"
+done
+[ "$sync_ok" = true ] || { echo "!! repo sync failed at every parallelism level"; kill "$PREFETCH_PID" 2>/dev/null || true; exit 1; }
+
+# ---- 3a. pin what was just synced -------------------------------------------------------------
+# repo sync follows the branch, so two builds a day apart are two different trees. Without a record
+# of which upstream revisions went in, a regression cannot be attributed: the patch series and upstream
+# both moved, and there is no way afterwards to tell which. `repo manifest -r` writes every
+# project's exact SHA, so each build says what it was made of, and PIN_MANIFEST can rebuild it.
+SNAP_DIR="$BUILD_ROOT/manifests"; mkdir -p "$SNAP_DIR"
+SNAP="$SNAP_DIR/manifest-$(date +%Y%m%d-%H%M%S).xml"
+if LOG_TAG=snap CONTAINER=aosp-${DEVICE_SLUG}-sync "$AOSP" \
+     bash -lc "cd /aosp && repo manifest -r -o /aosp/.manifest-snapshot.xml" 2>/dev/null \
+   && [ -s "$SRC/.manifest-snapshot.xml" ]; then
+  mv "$SRC/.manifest-snapshot.xml" "$SNAP"
+  ln -sfn "$(basename "$SNAP")" "$SNAP_DIR/latest.xml"
+  echo ">> [3a] pinned $(grep -c "<project" "$SNAP") project revisions -> manifests/$(basename "$SNAP")"
+else
+  echo "!! [3a] could not snapshot the manifest; this build will not be reproducible" >&2
+fi
+
+echo ">> [3/5] waiting for prefetch to finish"
+wait "$PREFETCH_PID" || { echo "!! prefetch failed — see logs/prefetch.log (a missing input must stop the build)" >&2; exit 1; }
+
+# ---- 3b. optionally detach from REPO_REFERENCE ----
+# A --reference saves the FIRST sync, not disk: afterwards this tree cannot outlive the one it borrows
+# from. That matters when the reference is another device's tree -- deleting it silently breaks this
+# one, and the breakage surfaces much later as missing objects.
+#
+# Done here rather than with repo's own flag, because repo has no working path for it on an
+# already-synced tree.
+#
+# ABSORB, do not probe. An earlier version tested each store with `rev-list --all --objects` and
+# dropped the alternate when that passed. It reported 1173 of 1174 "self-sufficient" and left a tree
+# whose next sync died with `fatal: unable to read tree` -- commit present, its tree missing.
+#
+# The reason is worth keeping, because the obvious diagnosis is wrong. --all does cover refs/remotes,
+# so on a COMPLETED sync it would have seen those objects. That tree's sync had been interrupted, so
+# repo had fetched objects into the reference but not yet moved the refs that reach them: the probe was
+# blind because the refs were not there yet, not because --all is too narrow.
+#
+# Absorbing everything does not depend on refs being complete, so it is correct either way. This step
+# also only runs after a successful sync, which is the other half of not repeating that."
+#
+# So every store gets `git repack -a`, which rewrites a single pack containing everything reachable
+# INCLUDING via the alternate, and the alternate is only removed once that succeeds. Slower and
+# correct. `repack -d` is refused ("cannot delete packs in a precious-objects repo") because repo sets
+# extensions.preciousObjects, so this uses -a alone and leaves the old pack in place.
+if [ "${REPO_DISSOCIATE:-0}" = 1 ] && [ -d "$SRC/.repo" ]; then
+  echo ">> [3b/5] detaching from the git-object reference (REPO_DISSOCIATE=1)"
+  _map="$BUILD_ROOT/logs/alternates-before-dissociate.txt"
+  mkdir -p "$(dirname "$_map")"
+  find "$SRC/.repo" -name alternates 2>/dev/null | sort | while read -r _a; do
+    printf '%s	%s
+' "$_a" "$(cat "$_a" 2>/dev/null)"
+  done > "$_map"
+  _n=$(grep -c . "$_map" || true)
+  if [ "${_n:-0}" -eq 0 ]; then
+    echo "   already detached: no alternates"
+  else
+    echo "   $_n alternate(s); recorded in ${_map#"$DEVICE_REPO"/}"
+    _absorbed=0; _stuck=0; _i=0
+    while IFS= read -r _a; do
+      _gd="${_a%/objects/info/alternates}"
+      _i=$((_i+1))
+      [ $((_i % 200)) -eq 0 ] && echo "   ... $_i/$_n"
+      # Copy in everything reachable through the alternate, THEN drop it. fsck --connectivity-only
+      # afterwards is the check that matters: it walks every object, not just ref-reachable ones.
+      if git --git-dir="$_gd" repack -a >/dev/null 2>&1 \
+         && rm -f "$_a" \
+         && git --git-dir="$_gd" fsck --connectivity-only --no-dangling >/dev/null 2>&1; then
+        _absorbed=$((_absorbed+1))
+      else
+        printf '%s\n' "$(grep -F "$_a" "$_map" | cut -f2)" > "$_a"   # put it back; never ship a store that cannot resolve
+        _stuck=$((_stuck+1)); echo "   !! could not detach ${_gd#"$SRC"/.repo/}, reference kept"
+      fi
+    done < <(find "$SRC/.repo" -name alternates 2>/dev/null | sort)
+    echo "   detached $_absorbed, kept $_stuck"
+    [ "$_stuck" -eq 0 ] && echo "   this tree no longer depends on $REPO_REFERENCE"
+  fi
+fi
+
+# ---- 4. apply patches ----
+echo ">> [4/5] apply overlay patches"
+# BUILD_OPTIONS goes in so apply-overlay knows which options are on. It needs that because an
+# option's PATCHES modify the tree, and the tree is built once for one image -- so patches for an
+# option this build does not want must not be applied at all.
+# FDROID_PINS too: the app fetchers run in there, and a host env var does not cross into docker.
+LOG_TAG=apply "$AOSP" bash -lc "BUILD_OPTIONS='${BUILD_OPTIONS:-}' FDROID_PINS='${FDROID_PINS:-}' /repo/forge/tools/apply-overlay.sh /aosp"
+
+# ---- 4b + 4c: extract OEM assets and Google apps CONCURRENTLY (disjoint dirs) ----
+EXTRACT_PIDS=()
+if [ "$WANT_OEM" = true ]; then
+  if [ -n "${STOCK_ROM:-}" ]; then
+    echo ">> [4b] extracting OEM assets from $(basename "$STOCK_ROM") (concurrent)"
+    ( STOCK_DIR="$(cd "$(dirname "$STOCK_ROM")" && pwd)" DL_DIR="$DL" CONTAINER=aosp-${DEVICE_SLUG}-oem LOG_TAG=oem "$AOSP" \
+        bash -lc "/repo/forge/tools/$OEM_EXTRACTOR '/stock/$(basename "$STOCK_ROM")' /aosp" ) & EXTRACT_PIDS+=($!)
+  else
+    echo ">> [4b] extracting OEM assets from prefetched stock ROM (concurrent)"
+    ( DL_DIR="$DL" CONTAINER=aosp-${DEVICE_SLUG}-oem LOG_TAG=oem "$AOSP" \
+        bash -lc "/repo/forge/tools/$OEM_EXTRACTOR '/dl/stock.zip' /aosp" ) & EXTRACT_PIDS+=($!)
+  fi
+fi
+if [ "$WANT_GAPPS" = true ]; then
+  echo ">> [4c] extracting Google apps (concurrent)"
+  if [ -n "${GAPPS_ZIP:-}" ]; then
+    ( GAPPS_DIR="$(cd "$(dirname "$GAPPS_ZIP")" && pwd)" DL_DIR="$DL" CONTAINER=aosp-${DEVICE_SLUG}-gapps LOG_TAG=gapps "$AOSP" bash -lc \
+        "/repo/forge/tools/extract-gapps-apps.sh '/gapps/$(basename "$GAPPS_ZIP")' /aosp" ) & EXTRACT_PIDS+=($!)
+  else
+    ( DL_DIR="$DL" CONTAINER=aosp-${DEVICE_SLUG}-gapps LOG_TAG=gapps "$AOSP" bash -lc \
+        "/repo/forge/tools/extract-gapps-apps.sh '/dl/gapps.zip' /aosp" ) & EXTRACT_PIDS+=($!)
+  fi
+fi
+if [ "${#EXTRACT_PIDS[@]}" -gt 0 ]; then
+  for p in "${EXTRACT_PIDS[@]}"; do
+    wait "$p" || { echo "!! an extractor failed — see logs/oem.log / logs/gapps.log" >&2; exit 1; }
+  done
+fi
+
+# ---- 5. build ----
+# [4/5] apply-overlay reinstalls local_manifests unconditionally, which undoes what the pin did
+# before sync. That matters here and not only at sync time: the ROM build itself runs
+# `repo manifest -o - -r` to write /product/etc/build-manifest.xml, and with the pin active those
+# projects are already in pinned.xml, so the target dies with
+#   error: in `manifest -o - -r`: duplicate path vendor/gapps
+# at around 50% of the build. A pinned run does not need the local manifests at all, because the
+# snapshot is the complete project set, and dropping them makes the shipped build-manifest.xml
+# record the pinned revisions, which is what it is for.
+if [ -n "${PIN_MANIFEST:-}" ]; then
+  rm -rf "$SRC/.repo/local_manifests"
+fi
+
+echo ">> [5/5] build the ROM(s) — progress in logs/build.log"
+LOG_TAG=build "$AOSP" bash -lc "JOBS=$JOBS PRESET='${PRESET:-}' OPTIONS='${BUILD_OPTIONS:-}' TURBO_BUILD_ID='${TURBO_BUILD_ID:-}' KEEP_GOING='${KEEP_GOING:-}' bash /repo/forge/docker/_build_rom.sh"
+
+echo
+# Package the on-device Linux chroot as a flashable Magisk module, next to the ROM. It is tiny
+# (~7 KB: scripts only, the rootfs is fetched on device) and independent of the ROM, so there is no
+# reason not to always emit it -- installing it is opt-in on the phone.
+if [ -d "$FORGE/modules/linux-chroot" ]; then
+  _lxzip="$BUILD_ROOT/linux-chroot-$(grep -oP '^version=\K.*' "$FORGE/modules/linux-chroot/module.prop" 2>/dev/null || echo v0).zip"
+  rm -f "$_lxzip"
+  if ( cd "$FORGE/modules/linux-chroot" && zip -qr "$_lxzip" . -x '.*' ) 2>/dev/null; then
+    echo "   Linux chroot module: $_lxzip  (install in Magisk, then run 'linux-setup')"
+  fi
+fi
+
+# Keep the flashable set outside out/: the next preset's installclean deletes every zip there, so
+# a build of `clean` after `cloud` silently costs the cloud zip. Hard links (same filesystem), so
+# free; recovery.img and boot.img travel with the zip they came from, named for it, the way
+# release.sh publishes them. release.sh reads out/ on purpose (it audits the tree); this is for
+# flashing.
+_out="$SRC/out/target/product/$DEVICE_CODENAME"
+# Newest by mtime, and among equal mtimes the highest name -- which is the later date, since the name
+# carries it. `ls -t | head -1` is not enough: two names can be one inode, and then their mtimes are
+# necessarily equal and the winner is whichever the locale sorts first. That published a zip under the
+# previous day's name once.
+_zip="$(find "$_out" -maxdepth 1 -name "lineage-*-$DEVICE_CODENAME.zip" -printf '%T@\t%p\n' 2>/dev/null \
+        | sort -k1,1nr -k2,2r | sed -n 1p | cut -f2)"
+if [ -n "$_zip" ]; then
+  _keep="$BUILD_ROOT/artifacts"; mkdir -p "$_keep"
+  _stem="$(basename "${_zip%.zip}")"
+  # Link, tolerating a destination that is already this very file. Without the -ef guard the cp fails
+  # with "are the same file" and takes the build's exit status with it -- after the rm above has
+  # already removed the previous set, so the failure also loses what it was replacing.
+  _keeplink() {
+    [ -f "$1" ] || return 0
+    [ "$1" -ef "$2" ] && return 0
+    rm -f "$2"
+    ln "$1" "$2" 2>/dev/null || cp "$1" "$2"
+  }
+  rm -f "$_keep/$_stem".*
+  _keeplink "$_zip" "$_keep/$_stem.zip"
+  for _img in recovery boot boot-magisk; do
+    _keeplink "$_out/$_img.img" "$_keep/$_stem-$_img.img"
+  done
+  ( cd "$_keep" && sha256sum "$_stem.zip" > "$_stem.zip.sha256" )
+fi
+
+echo "== DONE =="
+echo "   ROM(s): $SRC/out/target/product/$DEVICE_CODENAME/lineage-*-$DEVICE_CODENAME.zip"
+[ -n "$_zip" ] && echo "   kept:   $BUILD_ROOT/artifacts/$_stem.zip (+ -recovery/-boot/-boot-magisk.img; survives the next build)"
+echo "   Flash in recovery. See the device repo's flashing/ if present."

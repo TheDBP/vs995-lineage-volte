@@ -1,0 +1,7 @@
+# Pinned rom-forge commit vendored into forge/. Written by forge/tools/sync-forge.sh.
+# Update with: ./forge/tools/sync-forge.sh [ref]
+url=https://github.com/TheDBP/rom-forge.git
+ref=main
+commit=fda9f0490c3f358b35a69454ba63f9f864053251
+subject=publish-kernel-source.sh: find TARGET_KERNEL_SOURCE in a shared device tree too
+synced=2026-10-12T00:42:23Z

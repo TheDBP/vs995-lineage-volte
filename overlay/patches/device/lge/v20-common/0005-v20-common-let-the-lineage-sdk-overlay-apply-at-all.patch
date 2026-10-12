@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TheDBP <TheDBP@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 00:30:22 -0400
+Subject: [PATCH] v20-common: let the lineage-sdk overlay apply at all
+
+overlay-lineage is added through DEVICE_PACKAGE_OVERLAYS, but msm8996-common sets
+PRODUCT_ENFORCE_RRO_TARGETS := * and excludes only its own overlay-lineage/lineage-sdk from RRO
+enforcement. lineage-sdk's resource package gets no auto-generated RRO, so this tree's copy was
+neither compiled in nor overlaid at runtime. Every value in it was dropped with no diagnostic, for
+as long as the file has existed.
+
+Proven against the compiled resources in org.lineageos.platform-res.apk: the overlay asks for
+config_cleanupUnusedFingerprints false and the built value is true.
+
+The only value this changes in practice is config_deviceLightCapabilities, from lineage-sdk's
+default 8 to 0, which stops advertising LIGHTS_PULSATING_LED on a device with no notification LED.
+The other two in the file stay inert: config_haveNotch has no consumer in the tree, and
+config_cleanupUnusedFingerprints is read only by the AIDL FingerprintProvider while this device uses
+the HIDL fingerprint path.
+---
+ v20.mk | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/v20.mk b/v20.mk
+index 562287d..00a06e1 100644
+--- a/v20.mk
++++ b/v20.mk
+@@ -30,6 +30,14 @@ PRODUCT_COPY_FILES += \
+ DEVICE_PACKAGE_OVERLAYS += $(LOCAL_PATH)/overlay
+ DEVICE_PACKAGE_OVERLAYS += $(LOCAL_PATH)/overlay-lineage
+ 
++# msm8996-common sets PRODUCT_ENFORCE_RRO_TARGETS := *, so every overlay above becomes an
++# auto-generated RRO unless its path is excluded. lineage-sdk's resource package gets no
++# auto-generated RRO, so without this the overlay-lineage values are neither compiled in nor
++# overlaid at runtime: they are dropped, with nothing in the build log. Verify with
++# `aapt2 dump resources .../org.lineageos.platform-res.apk` rather than by reading the overlay.
++PRODUCT_ENFORCE_RRO_EXCLUDED_OVERLAYS += \
++    $(LOCAL_PATH)/overlay-lineage/lineage-sdk
++
+ PRODUCT_PACKAGES += \
+     AvoidAppsInCutoutOverlay
+ 

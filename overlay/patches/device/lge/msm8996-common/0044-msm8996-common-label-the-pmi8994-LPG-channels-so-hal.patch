@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: TheDBP <TheDBP@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 07:33:51 -0400
+Subject: [PATCH] msm8996-common: label the pmi8994 LPG channels so hal_light
+ is not denied
+
+hal_light enumerates /sys/class/leds at startup and reads max_brightness and
+trigger on the pmi8994 leds@d000 channels, a sibling of the haptics node that
+was already labelled. Only the label was missing, so every read was denied:
+
+  avc: denied { read } name="max_brightness" scontext=u:r:hal_light_default:s0
+       tcontext=u:object_r:sysfs:s0 tclass=file
+
+Nine denials a boot. hal_light already holds rw_file_perms on sysfs_leds in
+system sepolicy, so labelling the directory removes them.
+
+No LED is attached to those channels. The V20 has no notification LED and uses
+the second screen for notifications; the node is inherited from the PMI8994
+reference device tree and the qpnp driver binds to it regardless. Writes to
+brightness are accepted and read back at 255 with nothing illuminating, which
+is what a PMIC LPG output with nothing wired to it does. max_brightness
+reporting 255 and writes succeeding are properties of the driver, not evidence
+of an LED.
+
+This labels the nodes so the denials stop. It does not light anything, and
+nothing should be built on top of it expecting a notification light.
+---
+ sepolicy/vendor/genfs_contexts | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/sepolicy/vendor/genfs_contexts b/sepolicy/vendor/genfs_contexts
+index e45ec891..1ad0c097 100644
+--- a/sepolicy/vendor/genfs_contexts
++++ b/sepolicy/vendor/genfs_contexts
+@@ -43,5 +43,11 @@ genfscon sysfs /devices/soc/75b5000.i2c/i2c-7/7-001d/power_supply   u:object_r:s
+ # LEDs
+ genfscon sysfs /devices/soc/400f000.qcom,spmi/spmi-0/spmi0-03/400f000.qcom,spmi:qcom,pmi8994@3:qcom,haptics@c000/leds/vibrator   u:object_r:sysfs_leds:s0
+ genfscon sysfs /devices/soc/74a4900.sdhci/leds                                                                                    u:object_r:sysfs_leds:s0
++# The pmi8994 LPG channels, a sibling of the haptics node above. No LED is wired to them on this
++# hardware: the V20 has no notification LED and uses the second screen instead. The node comes from
++# the PMI8994 reference device tree and hal_light still enumerates it at startup, so without this
++# label the nodes stay u:object_r:sysfs:s0 and hal_light is denied reading max_brightness and
++# trigger. Labelling only silences those denials; it does not light anything.
++genfscon sysfs /devices/soc/400f000.qcom,spmi/spmi-0/spmi0-03/400f000.qcom,spmi:qcom,pmi8994@3:qcom,leds@d000/leds   u:object_r:sysfs_leds:s0
+ 
+ # ProcFS
